@@ -1,0 +1,199 @@
+import RPi.GPIO as GPIO
+import time
+import cv2
+import json
+import requests
+from pyzbar.pyzbar import decode
+from RPLCD.i2c import CharLCD
+
+# ================= SERVER =================
+SERVER_IP = "10.14.49.59"
+DECREMENT_API = f"http://{SERVER_IP}:3001/api/stock/decrement"
+STOCK_API = f"http://{SERVER_IP}:3001/api/stock"
+
+# ================= GPIO =================
+GPIO.setwarnings(False)
+GPIO.setmode(GPIO.BCM)
+
+# ================= LCD =================
+lcd = CharLCD('PCF8574', 0x27, port=1, cols=16, rows=2)
+
+def lcd_display(l1="", l2=""):
+    lcd.clear()
+    lcd.write_string(l1[:16].ljust(16))
+    lcd.cursor_pos = (1, 0)
+    lcd.write_string(l2[:16].ljust(16))
+
+# ================= BUZZER =================
+BUZZER = 26
+GPIO.setup(BUZZER, GPIO.OUT)
+
+def buzzer(t=0.2, n=1):
+    for _ in range(n):
+        GPIO.output(BUZZER, 1)
+        time.sleep(t)
+        GPIO.output(BUZZER, 0)
+        time.sleep(0.2)
+
+# ================= MOTORS =================
+MOTORS = {
+    "dolo650": [17,18,27,22],
+    "dart": [5,6,13,19],
+    "coldact": [12,16,20,21]
+}
+
+for pins in MOTORS.values():
+    for pin in pins:
+        GPIO.setup(pin, GPIO.OUT)
+        GPIO.output(pin, 0)
+
+# ================= STEPPER SEQUENCE =================
+SEQ = [
+    [1,0,0,0],
+    [1,1,0,0],
+    [0,1,0,0],
+    [0,1,1,0],
+    [0,0,1,0],
+    [0,0,1,1],
+    [0,0,0,1],
+    [1,0,0,1]
+]
+
+def setpins(step, pins):
+    for i in range(4):
+        GPIO.output(pins[i], step[i])
+
+def rotate(pins, rotations=1):
+    for _ in range(rotations * 512):
+        for s in SEQ:
+            setpins(s, pins)
+            time.sleep(0.001)
+    for p in pins:
+        GPIO.output(p, 0)
+
+# ================= SERVER FUNCTIONS =================
+def decrement_stock(name, qty):
+    try:
+        requests.post(DECREMENT_API, json={"token":name,"amount":qty}, timeout=5)
+    except:
+        pass
+
+def get_stock():
+    try:
+        return requests.get(STOCK_API, timeout=5).json()["stock"]
+    except:
+        return None
+
+# ================= CAMERA RESET =================
+def restart_camera(cap):
+    cap.release()
+    time.sleep(1)
+    return cv2.VideoCapture(0)
+
+# ================= PARSE INPUT =================
+def parse_items(raw_items):
+    parsed = []
+    for item in raw_items:
+        if "-" not in item:
+            continue
+        name, qty = item.split("-")
+        name = name.strip().lower()
+        qty = int(qty.strip())
+        parsed.append((name, qty))
+    return parsed
+
+# ================= QR SCANNER =================
+def qr():
+    cap = cv2.VideoCapture(0)
+    lcd_display("System Ready", "Scan QR")
+
+    lock = False
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            continue
+
+        decoded = decode(frame)
+
+        if not decoded and lock:
+            lock = False
+            lcd_display("System Ready","Scan QR")
+
+        for obj in decoded:
+
+            if lock:
+                continue
+            lock = True
+
+            # ---------- READ QR ----------
+            try:
+                data = json.loads(obj.data.decode())
+                raw_items = data["items"]
+                email = data.get("email","")
+                items = parse_items(raw_items)
+            except:
+                lcd_display("Invalid QR","Try Again")
+                buzzer(0.6,2)
+                continue
+
+            cap = restart_camera(cap)
+
+            # ---------- VALIDATE ----------
+            stock = get_stock()
+            if stock is None:
+                lcd_display("Server Error","Try Later")
+                buzzer(0.6,2)
+                time.sleep(3)
+                continue
+
+            lcd_display("Please Wait",f"{len(items)} Items")
+            buzzer(0.2,2)
+
+            dispensed = []
+            error = False
+
+            for name, qty in items:
+
+                if name not in MOTORS:
+                    lcd_display("Invalid Med",name[:16])
+                    buzzer(0.6,2)
+                    time.sleep(3)
+                    error = True
+                    break
+
+                available = stock.get(name,0)
+                if available < qty:
+                    lcd_display("Out of Stock",name[:16])
+                    buzzer(0.6,2)
+                    time.sleep(3)
+                    error = True
+                    break
+
+                lcd_display("Dispensing",name)
+                rotate(MOTORS[name], qty)
+                decrement_stock(name, qty)
+
+                dispensed.append((name,qty))
+
+            if not error and dispensed:
+                lcd_display("Completed","Take Medicines")
+                buzzer(0.5,3)
+                time.sleep(3)
+            else:
+                lcd_display("Failed","Scan Again")
+                time.sleep(2)
+
+        cv2.imshow("QR Scanner", frame)
+        if cv2.waitKey(1) == ord("q"):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+# ================= MAIN =================
+try:
+    qr()
+finally:
+    lcd.clear()
+    GPIO.cleanup()
