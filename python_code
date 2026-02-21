@@ -7,9 +7,10 @@ from pyzbar.pyzbar import decode
 from RPLCD.i2c import CharLCD
 
 # ================= SERVER =================
-SERVER_IP = "10.14.49.59"
+SERVER_IP = "10.202.12.59"
 DECREMENT_API = f"http://{SERVER_IP}:3001/api/stock/decrement"
 STOCK_API = f"http://{SERVER_IP}:3001/api/stock"
+RECEIPT_API = f"http://{SERVER_IP}:3001/send-receipt"
 
 # ================= GPIO =================
 GPIO.setwarnings(False)
@@ -84,6 +85,21 @@ def get_stock():
     except:
         return None
 
+def send_receipt(email, dispensed):
+    try:
+        now = time.strftime("%d-%m-%Y %H:%M:%S")
+
+        requests.post(RECEIPT_API, json={
+            "email": email,
+            "items": [{"name":n,"qty":q} for n,q in dispensed],
+            "time": now
+        }, timeout=10)
+
+        print("Receipt sent")
+
+    except Exception as e:
+        print("Receipt error:", e)
+
 # ================= CAMERA RESET =================
 def restart_camera(cap):
     cap.release()
@@ -116,6 +132,7 @@ def qr():
 
         decoded = decode(frame)
 
+        # unlock when QR removed
         if not decoded and lock:
             lock = False
             lcd_display("System Ready","Scan QR")
@@ -155,6 +172,7 @@ def qr():
 
             for name, qty in items:
 
+                # INVALID NAME
                 if name not in MOTORS:
                     lcd_display("Invalid Med",name[:16])
                     buzzer(0.6,2)
@@ -162,6 +180,7 @@ def qr():
                     error = True
                     break
 
+                # OUT OF STOCK
                 available = stock.get(name,0)
                 if available < qty:
                     lcd_display("Out of Stock",name[:16])
@@ -170,18 +189,26 @@ def qr():
                     error = True
                     break
 
+                # DISPENSE
                 lcd_display("Dispensing",name)
                 rotate(MOTORS[name], qty)
                 decrement_stock(name, qty)
 
                 dispensed.append((name,qty))
 
+            # ---------- FINAL STATUS ----------
             if not error and dispensed:
+
+                # SEND RECEIPT EMAIL
+                if email:
+                    send_receipt(email, dispensed)
+
                 lcd_display("Completed","Take Medicines")
                 buzzer(0.5,3)
                 time.sleep(3)
+
             else:
-                lcd_display("Failed","Scan Again")
+                lcd_display("Process Failed","Scan Again")
                 time.sleep(2)
 
         cv2.imshow("QR Scanner", frame)
